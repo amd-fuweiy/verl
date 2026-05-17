@@ -245,18 +245,43 @@ def _custom_flash_attention_forward(
         )
         attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
     else:
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            query_length,
-            is_causal=is_causal,
-            sliding_window=sliding_window,
-            use_top_left_mask=use_top_left_mask,
-            deterministic=deterministic,
-            **kwargs,
-        )  # do not pass position_ids to old flash_attention_forward
+        try:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
+                is_causal=is_causal,
+                sliding_window=sliding_window,
+                use_top_left_mask=use_top_left_mask,
+                deterministic=deterministic,
+                **kwargs,
+            )  # do not pass position_ids to old flash_attention_forward
+        except ValueError as e:
+            # ROCm environments can miss a usable flash-attn backend at runtime.
+            # Fall back to PyTorch SDPA to keep training/inference functional.
+            if "Could not find any flash attn implementation" not in str(e):
+                raise
+            q = query_states.transpose(1, 2)
+            k = key_states.transpose(1, 2)
+            v = value_states.transpose(1, 2)
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    sdpa_mask = attention_mask[:, None, None, :]
+                else:
+                    sdpa_mask = attention_mask
+            else:
+                sdpa_mask = None
+            dropout_p = kwargs.pop("dropout", 0.0)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=sdpa_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal and sdpa_mask is None,
+            ).transpose(1, 2)
 
     if sp_size > 1:
         # (batch_size, seq_length, num_head, head_size)
@@ -497,6 +522,14 @@ def forward_with_torch_backend(
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
+    def _is_dtensor(t: torch.Tensor) -> bool:
+        return hasattr(t, "device_mesh") and hasattr(t, "to_local")
+
+    def _to_plain_tensor(t: torch.Tensor) -> torch.Tensor:
+        if hasattr(t, "full_tensor"):
+            return t.full_tensor()
+        return t.to_local()
+
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
     hidden_states = outputs[0]
 
@@ -511,10 +544,23 @@ def forward_with_torch_backend(
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
+    vocab_weights = self.lm_head.weight
+    # Torch DTensor matmul requires both operands to be DTensor. In some ROCm
+    # runs we observe mixed Tensor/DTensor here, so normalize to plain tensors.
+    if _is_dtensor(hidden_states) != _is_dtensor(vocab_weights):
+        if _is_dtensor(hidden_states):
+            hidden_states = _to_plain_tensor(hidden_states)
+        if _is_dtensor(vocab_weights):
+            vocab_weights = _to_plain_tensor(vocab_weights)
+        if vocab_weights.device != hidden_states.device or vocab_weights.dtype != hidden_states.dtype:
+            vocab_weights = vocab_weights.to(
+                device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True
+            )
+
     fused_linear_for_ppo = FusedLinearForPPO()
     log_probs, entropy = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
-        vocab_weights=self.lm_head.weight,
+        vocab_weights=vocab_weights,
         input_ids=rolled_labels,
         temperature=temperature,
     )

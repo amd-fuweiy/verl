@@ -142,6 +142,9 @@ class SGLangHttpServer:
             f"{nnodes=}, {cuda_visible_devices=}, role={disaggregation_role}"
         )
         os.environ[visible_devices_keyword] = cuda_visible_devices
+        if torch.version.hip is not None:
+            # Keep HIP and CUDA visibility consistent on ROCm subprocesses.
+            os.environ["HIP_VISIBLE_DEVICES"] = cuda_visible_devices
 
         assert disaggregation_role in ("null", "prefill", "decode"), (
             f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}"
@@ -254,6 +257,9 @@ class SGLangHttpServer:
 
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
         attention_backend = engine_kwargs.pop("attention_backend", None)
+        mm_attention_backend = engine_kwargs.pop("mm_attention_backend", None)
+        default_attention_backend = "triton" if torch.version.hip is not None else "fa3"
+        default_mm_attention_backend = "triton_attn" if torch.version.hip is not None else "fa3"
         quantization = self.config.get("quantization", None)
         if quantization is not None:
             if quantization == "fp8":
@@ -287,8 +293,10 @@ class SGLangHttpServer:
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_running_requests": self.config.get("max_num_seqs", None),
             "log_level": "error",
-            "mm_attention_backend": "fa3",
-            "attention_backend": attention_backend if attention_backend is not None else "fa3",
+            "mm_attention_backend": (
+                mm_attention_backend if mm_attention_backend is not None else default_mm_attention_backend
+            ),
+            "attention_backend": attention_backend if attention_backend is not None else default_attention_backend,
             "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "skip_server_warmup": True,
             "quantization": quantization,
@@ -372,30 +380,30 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        # For SGLang main branch or version >= 0.5.10
-        # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
-        if version.parse(sglang.__version__) >= version.parse("0.5.10"):
-            from sglang.srt.entrypoints.http_server import Engine
+        # Prefer API feature detection over version strings because nightly/dev
+        # builds can report non-monotonic versions (e.g. 0.0.0.dev*).
+        import sglang.srt.entrypoints.http_server as http_server_mod
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
-        elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            from sglang.srt.entrypoints.http_server import _launch_subprocesses
-
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
+        launch_with_hooks_kwargs = {
+            "server_args": server_args,
+            "init_tokenizer_manager_func": sglang.srt.entrypoints.engine.init_tokenizer_manager,
+            "run_scheduler_process_func": sglang.srt.entrypoints.engine.run_scheduler_process,
+            "run_detokenizer_process_func": sglang.srt.entrypoints.engine.run_detokenizer_process,
+        }
+        if hasattr(http_server_mod, "Engine") and hasattr(http_server_mod.Engine, "_launch_subprocesses"):
+            launch_fn = http_server_mod.Engine._launch_subprocesses
+        elif hasattr(http_server_mod, "_launch_subprocesses"):
+            launch_fn = http_server_mod._launch_subprocesses
         else:
-            from sglang.srt.entrypoints.http_server import _launch_subprocesses
+            raise ImportError("Cannot find SGLang subprocess launcher in http_server module")
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+        try:
+            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = launch_fn(
+                **launch_with_hooks_kwargs
+            )
+        except TypeError:
+            # Older signatures only accept server_args.
+            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = launch_fn(
                 server_args=server_args
             )
 

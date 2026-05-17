@@ -25,7 +25,7 @@ try:
     from .torchtitan import TorchTitanEngine, TorchTitanEngineWithLMHead
 
     __all__ += ["TorchTitanEngine", "TorchTitanEngineWithLMHead"]
-except ImportError:
+except Exception:
     TorchTitanEngine = None
     TorchTitanEngineWithLMHead = None
 
@@ -33,7 +33,7 @@ try:
     from .veomni import VeOmniEngine, VeOmniEngineWithLMHead
 
     __all__ += ["VeOmniEngine", "VeOmniEngineWithLMHead"]
-except ImportError:
+except Exception:
     VeOmniEngine = None
     VeOmniEngineWithLMHead = None
 
@@ -41,7 +41,7 @@ try:
     from .automodel import AutomodelEngine, AutomodelEngineWithLMHead
 
     __all__ += ["AutomodelEngine", "AutomodelEngineWithLMHead"]
-except ImportError:
+except Exception:
     AutomodelEngine = None
     AutomodelEngineWithLMHead = None
 
@@ -50,7 +50,7 @@ try:
     from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead, MindSpeedLLMEngineWithLMHead
 
     __all__ += ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedLLMEngineWithLMHead"]
-except ImportError:
+except Exception:
     MindspeedEngineWithLMHead = None
     MindspeedEngineWithValueHead = None
     MindSpeedLLMEngineWithLMHead = None
@@ -59,6 +59,6 @@ try:
     from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead
 
     __all__ += ["MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"]
-except ImportError:
+except Exception:
     MegatronEngine = None
     MegatronEngineWithLMHead = None
